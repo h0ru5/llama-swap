@@ -4,7 +4,7 @@ summary: Name a model comfyui_auto and use /comfyui/ so ComfyUI's websocket does
 category: guides
 tags: [comfyui, image, websocket, upstream, swapping, ttl, docker]
 config_keys: [models.*.compat.ignoreWebsockets, models.*.concurrencyLimit, models.*.checkEndpoint, models.*.cmdStop, models.*.unloadTimeout, models.*.ttl, models.*.unlisted, upstream.ignorePaths]
-updated: 2026-09-21
+updated: 2026-11-13
 ---
 
 # ComfyUI with the /comfyui endpoint
@@ -102,6 +102,35 @@ as usual: the page itself, `/api/prompt`, and any path not in the list.
 
 Query parameters are not part of the match, so `?clientId=...` makes no
 difference. `/wsapi` and `/api/jobs/12` are different paths and are not ignored.
+
+## Jobs on the Activity page
+
+Every job queued through `/comfyui/` gets one row on the Activity page, with
+task `image_generation`. ComfyUI takes jobs on both `POST /api/prompt` (its
+frontend) and `POST /prompt` (many API clients), and both are recorded under
+the path the client used. ComfyUI answers as soon as the job is queued, so
+llama-swap writes the row when the job finishes. It checks ComfyUI's `/history/<prompt_id>` every two
+seconds by connecting to the model's `proxy` address directly. These checks
+never start the model or reset its TTL.
+
+| field | value |
+| --- | --- |
+| duration | run time from ComfyUI's own start and finish timestamps, not counting time spent waiting in the queue |
+| status | `200` on success, `500` with ComfyUI's exception message on a failed node, `499` when the job is interrupted |
+| metadata `outputs` | number of images, GIFs, videos and audio files the job produced |
+
+A job ComfyUI rejects outright, such as one that fails validation, is written
+right away with ComfyUI's status code and error message. Rows have no token
+counts.
+
+Not recorded:
+
+- Jobs queued on ComfyUI's own port or through `/upstream/<model>/`.
+- Jobs still running when llama-swap shuts down or reloads its config.
+
+A job still unfinished when the model stops is written as `503 model stopped
+before the job finished`. One still unfinished after 12 hours is written as
+`504`.
 
 ## What goes wrong
 

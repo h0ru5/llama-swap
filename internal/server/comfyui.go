@@ -1,11 +1,17 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/hint"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
@@ -89,5 +95,187 @@ func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
 		ModelID:  config.ComfyUIModelID,
 		Metadata: make(map[string]string),
 	}))
+	// ComfyUI takes jobs on both paths: its frontend uses /api/prompt, many API
+	// clients use /prompt.
+	if r.Method == http.MethodPost && (remainingPath == "/api/prompt" || remainingPath == "/prompt") && s.metrics != nil {
+		s.serveComfyUIPrompt(w, r)
+		return
+	}
 	s.serveLocal(w, r)
+}
+
+// comfyUIPollInterval is how often a queued job's history is checked, and
+// comfyUIJobMaxWait is how long a job may sit in the queue and run before the
+// watcher gives up on it. Vars so tests can shorten them.
+var (
+	comfyUIPollInterval = 2 * time.Second
+	comfyUIJobMaxWait   = 12 * time.Hour
+)
+
+// serveComfyUIPrompt forwards a job submission and files one activity row
+// for it. ComfyUI answers POST /api/prompt as soon as the job is queued, so
+// the row is written later by watchComfyUIJob, once the job has finished.
+func (s *Server) serveComfyUIPrompt(w http.ResponseWriter, r *http.Request) {
+	// The reply is a few bytes of JSON; keep it uncompressed so it can be read.
+	r.Header.Del("Accept-Encoding")
+	recorder := newBodyCopier(w)
+	s.serveLocal(recorder, r)
+	swaputil.MarkClientClosed(recorder, r)
+
+	tm, _ := s.metrics.newEntry(config.ComfyUIModelID, hint.TaskImageGeneration, r, recorder)
+	tm.ReqPath = "/comfyui" + r.URL.Path
+	tm.Route = string(hint.RouteLocal)
+
+	var queued struct {
+		PromptID string `json:"prompt_id"`
+	}
+	switch {
+	case recorder.Status() == swaputil.StatusClientClosedRequest:
+		tm.ErrorMsg = "client disconnected before response"
+	case recorder.Status() != http.StatusOK:
+		tm.ErrorMsg = failedErrorMessage(recorder.Status(), recorder.body.Bytes(), nil)
+	case json.Unmarshal(recorder.body.Bytes(), &queued) != nil || queued.PromptID == "":
+		tm.ErrorMsg = "ComfyUI did not return a prompt_id"
+	default:
+		go s.watchComfyUIJob(queued.PromptID, tm, recorder.StartTime())
+		return
+	}
+	s.fileComfyUIRow(tm)
+}
+
+// watchComfyUIJob polls ComfyUI's /history/<id> until the job finishes, then
+// files its row. It talks to the model's proxy address directly, not through
+// llama-swap, so polling never starts the model or resets its TTL. It stops
+// without a row when llama-swap shuts down.
+//
+// ponytail: one goroutine and one poll per queued job; fine for a person
+// clicking Queue, switch to one shared poll of /history if jobs pile up.
+func (s *Server) watchComfyUIJob(promptID string, tm ActivityLogEntry, queuedAt time.Time) {
+	historyURL := strings.TrimRight(s.cfg.Models[config.ComfyUIModelID].Proxy, "/") +
+		"/history/" + url.PathEscape(promptID)
+	client := &http.Client{Timeout: 10 * time.Second}
+	ticker := time.NewTicker(comfyUIPollInterval)
+	defer ticker.Stop()
+	deadline := time.Now().Add(comfyUIJobMaxWait)
+
+	for {
+		select {
+		case <-s.shutdownCtx.Done():
+			return
+		case <-ticker.C:
+		}
+		if state, ok := s.local.RunningModels()[config.ComfyUIModelID]; !ok || state != process.StateReady {
+			tm.RespStatusCode = http.StatusServiceUnavailable
+			tm.ErrorMsg = "model stopped before the job finished"
+			break
+		}
+		if time.Now().After(deadline) {
+			tm.RespStatusCode = http.StatusGatewayTimeout
+			tm.ErrorMsg = "gave up waiting for the job to finish"
+			break
+		}
+		job, ok := fetchComfyUIJob(s.shutdownCtx, client, historyURL, promptID)
+		if !ok {
+			continue // not finished yet, or ComfyUI was briefly unreachable
+		}
+		job.fill(&tm)
+		break
+	}
+	if tm.DurationMs == 0 {
+		tm.DurationMs = int(time.Since(queuedAt).Milliseconds())
+	}
+	tm.Timestamp = time.Now()
+	s.fileComfyUIRow(tm)
+}
+
+func (s *Server) fileComfyUIRow(tm ActivityLogEntry) {
+	if stored, ok := s.metrics.queueMetrics(tm); ok {
+		s.metrics.emitMetric(stored)
+	}
+}
+
+// comfyUIJob is one entry of ComfyUI's /history/<id> response.
+type comfyUIJob struct {
+	Status struct {
+		StatusStr string `json:"status_str"`
+		// Messages are [name, data] pairs, e.g.
+		// ["execution_start", {"prompt_id": "...", "timestamp": 1700000000000}].
+		Messages [][]json.RawMessage `json:"messages"`
+	} `json:"status"`
+	Outputs map[string]map[string]json.RawMessage `json:"outputs"`
+}
+
+// fetchComfyUIJob returns the job once ComfyUI reports it finished. The
+// history entry only appears when the job is done, success or error.
+func fetchComfyUIJob(ctx context.Context, client *http.Client, historyURL, promptID string) (comfyUIJob, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, historyURL, nil)
+	if err != nil {
+		return comfyUIJob{}, false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return comfyUIJob{}, false
+	}
+	defer resp.Body.Close()
+	var history map[string]comfyUIJob
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&history) != nil {
+		return comfyUIJob{}, false
+	}
+	job, ok := history[promptID]
+	return job, ok && job.Status.StatusStr != ""
+}
+
+// fill copies a finished job's result into its activity row: the run time
+// from ComfyUI's own timestamps, the error for a failed job, and how many
+// files it produced.
+func (j comfyUIJob) fill(tm *ActivityLogEntry) {
+	var start, end int64
+	for _, m := range j.Status.Messages {
+		if len(m) != 2 {
+			continue
+		}
+		var name string
+		var data struct {
+			Timestamp        int64  `json:"timestamp"`
+			ExceptionMessage string `json:"exception_message"`
+		}
+		if json.Unmarshal(m[0], &name) != nil || json.Unmarshal(m[1], &data) != nil {
+			continue
+		}
+		switch name {
+		case "execution_start":
+			start = data.Timestamp
+		case "execution_success":
+			end = data.Timestamp
+		case "execution_error":
+			end = data.Timestamp
+			tm.RespStatusCode = http.StatusInternalServerError
+			tm.ErrorMsg = strings.TrimSpace(data.ExceptionMessage)
+		case "execution_interrupted":
+			end = data.Timestamp
+			tm.RespStatusCode = swaputil.StatusClientClosedRequest
+			tm.ErrorMsg = "interrupted"
+		}
+	}
+	if j.Status.StatusStr != "success" && tm.ErrorMsg == "" {
+		tm.RespStatusCode = http.StatusInternalServerError
+		tm.ErrorMsg = "job failed"
+	}
+	if start > 0 && end >= start {
+		tm.DurationMs = int(end - start)
+	}
+
+	outputs := 0
+	for _, node := range j.Outputs {
+		for _, key := range []string{"images", "gifs", "videos", "audio"} {
+			var files []json.RawMessage
+			if json.Unmarshal(node[key], &files) == nil {
+				outputs += len(files)
+			}
+		}
+	}
+	if tm.Metadata == nil {
+		tm.Metadata = make(map[string]string)
+	}
+	tm.Metadata["outputs"] = strconv.Itoa(outputs)
 }
